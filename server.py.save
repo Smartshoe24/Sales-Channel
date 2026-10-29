@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""Local Stepwhere Sales Desk server with Shopify and Amazon order sync."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+ROOT = Path(__file__).resolve().parent
+DIST = ROOT / "dist"
+STATE_FILE = ROOT / ".sync_state.json"
+
+
+def load_env():
+    env_path = ROOT / ".env"
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def read_state():
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def write_state(data):
+    STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def request_json(url, *, method="GET", headers=None, data=None, timeout=30):
+    body = None
+    req_headers = {"Accept": "application/json", "User-Agent": "StepwhereSalesDesk/1.0 Python"}
+    if headers:
+        req_headers.update(headers)
+    if data is not None:
+        if isinstance(data, dict):
+            body = json.dumps(data).encode("utf-8")
+            req_headers.setdefault("Content-Type", "application/json")
+        else:
+            body = data
+    req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            return json.loads(res.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:500]
+        raise RuntimeError(f"API returned {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Connection failed: {exc.reason}") from exc
+
+
+def amount(value):
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def reconcile(subtotal, total):
+    if total >= subtotal:
+        return round(total - subtotal, 2), 0.0
+    return 0.0, round(subtotal - total, 2)
+
+
+def sync_shopify(created_after):
+    store = os.getenv("SHOPIFY_STORE", "").replace("https://", "").rstrip("/")
+    token = os.getenv("SHOPIFY_ACCESS_TOKEN", "")
+    version = os.getenv("SHOPIFY_API_VERSION", "2026-07")
+    if not store or not token:
+        raise RuntimeError("Shopify setup required")
+    query = """
+    query StepwhereOrders($query: String!) {
+      orders(first: 100, reverse: true, sortKey: CREATED_AT, query: $query) {
+        nodes {
+          id name createdAt displayFinancialStatus displayFulfillmentStatus email phone
+          currentTotalPriceSet { shopMoney { amount currencyCode } }
+          currentSubtotalPriceSet { shopMoney { amount currencyCode } }
+          customer { displayName email phone }
+          shippingAddress { name phone address1 address2 city province zip country }
+          lineItems(first: 100) {
+            nodes { title variantTitle quantity discountedUnitPriceAfterAllDiscountsSet { shopMoney { amount } } }
+          }
+        }
+      }
+    }
+    """
+    payload = request_json(
+        f"https://{store}/admin/api/{version}/graphql.json",
+        method="POST",
+        headers={"X-Shopify-Access-Token": token},
+        data={"query": query, "variables": {"query": f"created_at:>={created_after}"}},
+    )
+    if payload.get("errors"):
+        raise RuntimeError("Shopify: " + payload["errors"][0].get("message", "GraphQL error"))
+    result = []
+    for order in payload.get("data", {}).get("orders", {}).get("nodes", []):
+        address = order.get("shippingAddress") or {}
+        customer = order.get("customer") or {}
+        items = []
+        for item in order.get("lineItems", {}).get("nodes", []):
+            variant = item.get("variantTitle")
+            title = item.get("title") or "Shopify item"
+            if variant and variant != "Default Title":
+                title += f" — {variant}"
+            price = amount(((item.get("discountedUnitPriceAfterAllDiscountsSet") or {}).get("shopMoney") or {}).get("amount"))
+            items.append({"name": title, "qty": int(item.get("quantity") or 1), "price": price})
+        subtotal = amount(((order.get("currentSubtotalPriceSet") or {}).get("shopMoney") or {}).get("amount"))
+        total = amount(((order.get("currentTotalPriceSet") or {}).get("shopMoney") or {}).get("amount"))
+        shipping, discount = reconcile(subtotal, total)
+        fulfillment = (order.get("displayFulfillmentStatus") or "").upper()
+        financial = (order.get("displayFinancialStatus") or "").upper()
+        status = "delivered" if fulfillment == "FULFILLED" else "processing" if fulfillment in {"PARTIALLY_FULFILLED", "IN_PROGRESS"} else "confirmed"
+        if financial in {"VOIDED", "REFUNDED"}:
+            status = "cancelled"
+        contact = address.get("name") or customer.get("displayName") or "Shopify customer"
+        result.append({
+            "id": "SHOP-" + str(order.get("name") or order.get("id", "")).lstrip("#"),
+            "invoice": "SW-" + str(order.get("name") or order.get("id", "")).lstrip("#"),
+            "customer": contact,
+            "contact": contact,
+            "phone": address.get("phone") or order.get("phone") or customer.get("phone") or "",
+            "email": order.get("email") or customer.get("email") or "",
+            "address": ", ".join(str(address.get(k)) for k in ("address1", "address2", "city", "province", "zip", "country") if address.get(k)),
+            "gstin": "", "channel": "Shopify", "date": (order.get("createdAt") or "")[:10],
+            "status": status, "payment": "paid" if financial in {"PAID", "PARTIALLY_REFUNDED"} else "pending",
+            "items": items or [{"name": "Shopify order", "qty": 1, "price": subtotal}],
+            "shipping": shipping, "discount": discount, "taxRate": 0,
+            "notes": "Synced automatically from Shopify"
+        })
+    return result
+
+
+def amazon_access_token():
+    required = ["AMAZON_LWA_CLIENT_ID", "AMAZON_LWA_CLIENT_SECRET", "AMAZON_REFRESH_TOKEN"]
+    if any(not os.getenv(k) for k in required):
+        raise RuntimeError("Amazon setup required")
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": os.environ["AMAZON_REFRESH_TOKEN"],
+        "client_id": os.environ["AMAZON_LWA_CLIENT_ID"],
+        "client_secret": os.environ["AMAZON_LWA_CLIENT_SECRET"],
+    }).encode("utf-8")
+    result = request_json("https://api.amazon.com/auth/o2/token", method="POST", headers={"Content-Type": "application/x-www-form-urlencoded"}, data=body)
+    return result["access_token"]
+
+
+def amazon_get(endpoint, token, params=None):
+    base = os.getenv("AMAZON_SP_API_ENDPOINT", "https://sellingpartnerapi-eu.amazon.com").rstrip("/")
+    url = base + endpoint
+    if params:
+        url += "?" + urllib.parse.urlencode(params, doseq=True)
+    return request_json(url, headers={"x-amz-access-token": token, "x-amz-date": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")})
+
+
+def sync_amazon(created_after):
+    token = amazon_access_token()
+    marketplace = os.getenv("AMAZON_MARKETPLACE_ID", "A21TJRUUN4KGV")
+    data = amazon_get("/orders/v0/orders", token, {"MarketplaceIds": marketplace, "CreatedAfter": created_after, "MaxResultsPerPage": 50})
+    orders = data.get("payload", {}).get("Orders", [])
+    result = []
+    status_map = {"Pending":"confirmed", "PendingAvailability":"confirmed", "Unshipped":"confirmed", "PartiallyShipped":"processing", "Shipped":"shipped", "Canceled":"cancelled", "Unfulfillable":"cancelled", "InvoiceUnconfirmed":"confirmed"}
+    for order in orders[:50]:
+        order_id = order.get("AmazonOrderId", "")
+        try:
+            item_data = amazon_get(f"/orders/v0/orders/{urllib.parse.quote(order_id)}/orderItems", token)
+            raw_items = item_data.get("payload", {}).get("OrderItems", [])
+        except RuntimeError:
+            raw_items = []
+        items = []
+        for item in raw_items:
+            qty = int(item.get("QuantityOrdered") or 1)
+            total_price = amount((item.get("ItemPrice") or {}).get("Amount"))
+            items.append({"name": item.get("Title") or item.get("SellerSKU") or "Amazon item", "qty": qty, "price": round(total_price / qty, 2) if qty else total_price})
+        order_total = amount((order.get("OrderTotal") or {}).get("Amount"))
+        subtotal = sum(i["qty"] * i["price"] for i in items)
+        shipping, discount = reconcile(subtotal, order_total)
+        status = status_map.get(order.get("OrderStatus"), "processing")
+        result.append({
+            "id": "AMZ-" + order_id, "invoice": "SW-AMZ-" + order_id[-8:],
+            "customer": "Amazon customer", "contact": "Amazon customer", "phone": "", "email": "", "address": "Available in Amazon Seller Central",
+            "gstin": "", "channel": "Amazon", "date": (order.get("PurchaseDate") or "")[:10],
+            "status": status, "payment": "pending" if order.get("OrderStatus") in {"Pending", "PendingAvailability"} else "paid",
+            "items": items or [{"name": "Amazon order", "qty": 1, "price": order_total}],
+            "shipping": shipping, "discount": discount, "taxRate": 0,
+            "notes": "Synced automatically from Amazon India. Buyer details require approved restricted access."
+        })
+    return result
+
+
+class Handler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(DIST), **kwargs)
+
+    def send_json(self, payload, status=200):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/api/status":
+            state = read_state()
+            self.send_json({
+                "shopify": bool(os.getenv("SHOPIFY_STORE") and os.getenv("SHOPIFY_ACCESS_TOKEN")),
+                "amazon": bool(os.getenv("AMAZON_LWA_CLIENT_ID") and os.getenv("AMAZON_LWA_CLIENT_SECRET") and os.getenv("AMAZON_REFRESH_TOKEN")),
+                "last_sync": state.get("last_sync")
+            })
+            return
+        super().do_GET()
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/api/sync":
+            self.send_json({"error": "Not found"}, 404)
+            return
+        channel = urllib.parse.parse_qs(parsed.query).get("channel", ["all"])[0]
+        lookback = max(1, min(90, int(os.getenv("SYNC_LOOKBACK_DAYS", "30"))))
+        created_after = (datetime.now(timezone.utc) - timedelta(days=lookback)).isoformat().replace("+00:00", "Z")
+        orders, errors = [], []
+        if channel in {"all", "shopify"} and os.getenv("SHOPIFY_STORE") and os.getenv("SHOPIFY_ACCESS_TOKEN"):
+            try:
+                orders.extend(sync_shopify(created_after))
+            except RuntimeError as exc:
+                errors.append(str(exc))
+        elif channel == "shopify":
+            errors.append("Shopify setup required")
+        if channel in {"all", "amazon"} and os.getenv("AMAZON_LWA_CLIENT_ID") and os.getenv("AMAZON_LWA_CLIENT_SECRET") and os.getenv("AMAZON_REFRESH_TOKEN"):
+            try:
+                orders.extend(sync_amazon(created_after))
+            except RuntimeError as exc:
+                errors.append(str(exc))
+        elif channel == "amazon":
+            errors.append("Amazon setup required")
+        now = datetime.now(timezone.utc).isoformat()
+        write_state({"last_sync": now})
+        self.send_json({"orders": orders, "errors": errors, "last_sync": now})
+
+
+def main():
+    load_env()
+    port = int(os.getenv("PORT", "8080"))
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    print(f"Stepwhere Sales Desk is running at http://127.0.0.1:{port}")
+    print("Keep this window open while using live marketplace sync.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
