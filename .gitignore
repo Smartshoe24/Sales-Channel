@@ -1,0 +1,13 @@
+# Local secrets — never commit
+.env
+
+# Written by server.py while it runs
+.sync_state.json
+.sync_state.tmp
+
+# Editor / OS leftovers
+*.save
+*.swp
+*~
+.DS_Store
+__pycache__/
