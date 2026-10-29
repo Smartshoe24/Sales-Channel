@@ -20,14 +20,26 @@ Always open the app at the same address (for example always `http://localhost:80
 
 ## Shopify connection
 
-The Shopify app needs `read_orders` access (Shopify only returns the last 60 days of orders with this scope). Put the store's `*.myshopify.com` domain and Admin API access token into `.env`:
+Since 1 January 2026 new Shopify apps are made in the Shopify **Dev Dashboard**. These apps don't show an access token to copy. Instead, the server exchanges the app's Client ID and Client secret for an access token that lasts 24 hours, and renews it automatically.
+
+1. In Shopify admin open **Settings → Apps and sales channels → Develop apps** and click **Build apps in Dev Dashboard**. Create an app, for example "Stepwhere Sales Desk".
+2. Create an app version with the **`read_orders`** access scope, release it, and install the app on your store.
+3. Optional but recommended: in the app's API access settings request **Protected customer data** access for name, email, phone and address. Without it, orders still sync but customer names, phones and addresses stay hidden.
+4. Copy the **Client ID** and **Client secret** from the app's Settings page into `.env`:
 
 ```text
 SHOPIFY_STORE=your-store.myshopify.com
-SHOPIFY_ACCESS_TOKEN=your-token
+SHOPIFY_CLIENT_ID=your-client-id
+SHOPIFY_CLIENT_SECRET=your-client-secret
 ```
 
-Custom apps created in the Shopify admin before 1 January 2026 still show their Admin API token there. Since that date new custom apps are created in the Shopify Dev Dashboard, which does not display a token to copy; the token is obtained through the app's install flow.
+5. Restart `server.py`. The Terminal window prints `Shopify: connected to <store name>` or the reason it couldn't connect.
+
+If you already have an older app created in Shopify admin before 2026 with an Admin API access token (`shpat_…`), put it in `SHOPIFY_ACCESS_TOKEN` instead of the Client ID and secret.
+
+Notes:
+- The Client ID/secret method only works for a store that belongs to the same Shopify organization as the app. Creating the app from the store's own admin (step 1) makes sure of that.
+- With `read_orders`, Shopify only returns orders from the last 60 days.
 
 ## Amazon India connection
 
