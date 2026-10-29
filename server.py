@@ -31,15 +31,36 @@ SYNC_LOCK = threading.Lock()
 
 
 def load_env():
+    """Read .env beside server.py. Returns a short status line for the Terminal."""
     env_path = ROOT / ".env"
     if not env_path.exists():
-        return
-    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        # Common slip on a Mac: TextEdit saves ".env" as ".env.txt", or the dot is missing.
+        for wrong in (".env.txt", "env", "env.txt", ".env.rtf"):
+            if (ROOT / wrong).exists():
+                return f".env: not found, but found '{wrong}'. Rename it to exactly '.env' (no .txt at the end)."
+        return f".env: not found in {ROOT}. Copy .env.example to .env in this folder and fill it in."
+    for raw in env_path.read_text(encoding="utf-8-sig").splitlines():
         line = raw.strip()
+        if line.startswith("export "):
+            line = line[7:].strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    return f".env: loaded from {env_path}"
+
+
+def shopify_setup_hint():
+    """Explain which Shopify lines are missing, without printing any secret values."""
+    missing = []
+    if not os.getenv("SHOPIFY_STORE"):
+        missing.append("SHOPIFY_STORE")
+    if not os.getenv("SHOPIFY_ACCESS_TOKEN"):
+        if not os.getenv("SHOPIFY_CLIENT_ID"):
+            missing.append("SHOPIFY_CLIENT_ID")
+        if not os.getenv("SHOPIFY_CLIENT_SECRET"):
+            missing.append("SHOPIFY_CLIENT_SECRET")
+    return "Shopify: not set up. Missing or empty in .env: " + ", ".join(missing) if missing else ""
 
 
 def read_state():
@@ -429,7 +450,7 @@ def run_sync(channel):
                 continue
             if not credentials_present(name):
                 if channel == name:
-                    errors.append(f"{label} setup required")
+                    errors.append(shopify_setup_hint() if name == "shopify" else f"{label} setup required")
                 continue
             now = datetime.now(timezone.utc)
             try:
@@ -511,15 +532,16 @@ def report_shopify_connection():
 
 
 def main():
-    load_env()
+    env_status = load_env()
     port = int(os.getenv("PORT") or "8080")
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"Stepwhere Sales Desk is running at http://127.0.0.1:{port}")
     print("Keep this window open while using live marketplace sync.")
+    print(env_status)
     if shopify_mode():
         threading.Thread(target=report_shopify_connection, daemon=True).start()
     else:
-        print("Shopify: not set up (add SHOPIFY_STORE and either SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET or SHOPIFY_ACCESS_TOKEN to .env).")
+        print(shopify_setup_hint())
     try:
         server.serve_forever()
     except KeyboardInterrupt:
